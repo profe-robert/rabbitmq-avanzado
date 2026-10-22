@@ -1,5 +1,8 @@
 package com.example.controller;
 
+import java.util.UUID;
+
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -12,6 +15,29 @@ import lombok.RequiredArgsConstructor;
 public class RabbitMQController {
 
     private final RabbitResourceManager resourceManager;
+    private final RabbitTemplate rabbitTemplate; // Inyectar RabbitTemplate
+
+    // Endpoint para publicar una orden de prueba en orders.queue
+    @PostMapping("/orders")
+    public ResponseEntity<String> sendOrder(@RequestParam String orderId) {
+        // Envía el mensaje directamente a orders.queue usando el exchange por defecto ("")
+        rabbitTemplate.convertAndSend("", "orders.queue", orderId);
+        return ResponseEntity.ok("Orden enviada a la cola: " + orderId);
+    }
+
+    // Envío en ráfaga indicando solo una cantidad numérica y el prefijo del mensaje
+    @PostMapping("/orders/burst")
+    public ResponseEntity<String> sendBurstOrders(
+            @RequestParam(defaultValue = "10") int count,
+            @RequestParam(defaultValue = "ORD") String prefix) {
+
+        for (int i = 1; i <= count; i++) {
+            String orderId = prefix + "-" + i + "-" + String.format("%03d", i) + "-" + UUID.randomUUID().toString().substring(0, 4);
+            rabbitTemplate.convertAndSend("", "orders.queue", orderId);
+        }
+
+        return ResponseEntity.ok("Se generaron y enviaron " + count + " órdenes con prefijo '" + prefix + "'");
+    }
 
     // Endpoint POST para crear colas
     @PostMapping("/queues")

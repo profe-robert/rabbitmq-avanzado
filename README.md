@@ -170,7 +170,8 @@ Puedes inspeccionar el clúster desde el navegador (Credenciales: `admin` / `adm
 Abre otra terminal y ejecuta el siguiente flujo de prueba:
 
 ```bash
-# 1. Crear la cola que escucha el listener (orders.queue)
+# 1. (OPCIONAL) Solo si no se ha creado aún la cola o si quieres crear una nueva
+# Crear la cola que escucha el listener (orders.queue)
 curl -i -X POST "http://localhost:8080/api/rabbitmq/queues?queueName=orders.queue"
 
 # 2. Consultar listeners registrados (retorna ["order-listener"])
@@ -184,6 +185,109 @@ curl -i -X POST "http://localhost:8080/api/listeners/order-listener/resume"
 
 # 5. Consultar métricas de la cola
 curl -i "http://localhost:8080/api/rabbitmq/queues/orders.queue"
+```
+
+## 🧪 Pruebas de Flujo de Mensajería y Control Dinámico de Listeners
+
+En esta sección se evalúa el comportamiento del sistema ante dos escenarios habituales:
+1. **Consumo en tiempo real** de mensajes individuales.
+2. **Buffer/Acumulación de mensajes en ráfaga (*burst*)** al suspender dinámicamente el consumidor, seguido del procesamiento concurrente al reanudarlo.
+
+---
+
+### Escenario 1: Envío y Consumo Inmediato de Mensajes Individuales
+
+Envía un mensaje individual para verificar que el listener activo lo procesa en tiempo real:
+
+```bash
+curl -i -X POST "http://localhost:8080/api/rabbitmq/orders?orderId=ORD-1001"
+```
+
+* **Respuesta HTTP:** `200 OK` con el mensaje:
+  ```text
+  Orden enviada a la cola: ORD-1001
+  ```
+* **Comportamiento en Logs (Spring Boot):**
+  El contenedor toma la orden de inmediato y simula el trabajo durante 2 segundos (`Thread.sleep(2000)`):
+  ```text
+  [pool-X-thread-Y] INFO  c.e.listener.OrderListener - Procesando orden: ORD-1001
+  [pool-X-thread-Y] INFO  c.e.listener.OrderListener - Orden procesada: ORD-1001
+  ```
+
+---
+
+### Escenario 2: Acumulación en Ráfaga (*Burst*) con Listener Pausado
+
+Este flujo demuestra la capacidad de RabbitMQ para actuar como un búfer de alta disponibilidad y resiliencia: la aplicación puede suspender temporalmente el procesamiento de tareas (por ejemplo, para mantenimiento de dependencias downstream) sin perder mensajes, procesándolos de manera concurrente al reactivarse.
+
+#### Paso 1: Pausar el Listener dinámicamente
+Detén el consumo de mensajes de la cola `orders.queue`:
+
+```bash
+curl -i -X POST "http://localhost:8080/api/listeners/order-listener/pause"
+```
+* **Respuesta:** `Listener pausado: order-listener`
+* **Log en Spring Boot:** `Listener pausado (detenido): order-listener`
+
+#### Paso 2: Enviar ráfaga masiva de mensajes
+Con el consumidor detenido, despacha una ráfaga de 12 órdenes ficticias:
+
+```bash
+curl -i -X POST "http://localhost:8080/api/rabbitmq/orders/burst?count=12&prefix=ORD-BURST"
+```
+* **Respuesta:**
+  ```text
+  Se generaron y enviaron 12 órdenes con prefijo 'ORD-BURST'
+  ```
+
+#### Paso 3: Validar el encolamiento y acumulación en el Broker
+Verifica el estado de la cola consultando la API:
+
+```bash
+curl -s "http://localhost:8080/api/rabbitmq/queues/orders.queue"
+```
+* **Respuesta JSON esperada:**
+  ```json
+  {
+    "name": "orders.queue",
+    "messageCount": 12,
+    "consumerCount": 0
+  }
+  ```
+* **En RabbitMQ Management (`http://localhost:15672`):**
+  En la pestaña **Queues**, la cola `orders.queue` mostrará `12 Ready Messages` y `0 Consumers`. Los mensajes permanecen retenidos y persistidos de forma segura en el clúster.
+
+#### Paso 4: Reanudar el Listener y observar el procesamiento concurrente
+Reactiva el consumidor:
+
+```bash
+curl -i -X POST "http://localhost:8080/api/listeners/order-listener/resume"
+```
+* **Respuesta:** `Listener reanudado: order-listener`
+* **Comportamiento en Logs (Spring Boot):**
+  Gracias a la concurrencia configurada (`setConcurrentConsumers(3)`), 3 hilos tomarán lotes de mensajes simultáneamente, liquidando las 12 órdenes en aproximadamente 8 segundos (en vez de los 24 segundos que tomaría en modo secuencial):
+  ```text
+  [orderListenerFactory-1] INFO  c.e.listener.OrderListener - Procesando orden: ORD-BURST-001-a1b2
+  [orderListenerFactory-2] INFO  c.e.listener.OrderListener - Procesando orden: ORD-BURST-002-c3d4
+  [orderListenerFactory-3] INFO  c.e.listener.OrderListener - Procesando orden: ORD-BURST-003-e5f6
+  ...
+  [orderListenerFactory-1] INFO  c.e.listener.OrderListener - Orden procesada: ORD-BURST-001-a1b2
+  [orderListenerFactory-2] INFO  c.e.listener.OrderListener - Orden procesada: ORD-BURST-002-c3d4
+  [orderListenerFactory-3] INFO  c.e.listener.OrderListener - Orden procesada: ORD-BURST-003-e5f6
+  ```
+
+#### Paso 5: Confirmar cola procesada
+Una vez completado el procesamiento, valida que la cola haya retornado a cero mensajes pendientes:
+
+```bash
+curl -s "http://localhost:8080/api/rabbitmq/queues/orders.queue"
+```
+```json
+{
+  "name": "orders.queue",
+  "messageCount": 0,
+  "consumerCount": 3
+}
 ```
 
 ---
